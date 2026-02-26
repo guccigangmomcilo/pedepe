@@ -1,0 +1,1021 @@
+// PRVI ZADACI
+
+// Implementirati šablon klase Vector ne koristiti standardnu biblioteku. Napisati potreban i dovoljan skup konstruktora, operatora dodele i destruktor. Preklopiti i parlelizovati operatore dekrementiranja i sabiranja. Implementisati i paralelizovati izračunavanje euklidove vektorske norme.
+
+#include <iostream>
+#include <cmath>
+#include <thread>
+#include <vector> // Isključivo za čuvanje std::thread objekata
+
+template <typename T>
+class Vector {
+private:
+    T* data;
+    size_t sz;
+
+    // Pomoćna funkcija za paralelizaciju (sabiranje)
+    static void parallel_add(const T* a, const T* b, T* res, size_t start, size_t end) {
+        for (size_t i = start; i < end; ++i) res[i] = a[i] + b[i];
+    }
+
+    // Pomoćna funkcija za paralelizaciju (norma)
+    static void parallel_norm_sq(const T* d, size_t start, size_t end, T& partial_sum) {
+        T sum = 0;
+        for (size_t i = start; i < end; ++i) sum += d[i] * d[i];
+        partial_sum = sum;
+    }
+
+public:
+    // 1. Konstruktori i destruktor
+    explicit Vector(size_t n = 0) : sz(n), data(n > 0 ? new T[n]{} : nullptr) {}
+
+    // Copy konstruktor
+    Vector(const Vector& other) : sz(other.sz), data(new T[other.sz]) {
+        for (size_t i = 0; i < sz; ++i) data[i] = other.data[i];
+    }
+
+    // Move konstruktor
+    Vector(Vector&& other) noexcept : data(other.data), sz(other.sz) {
+        other.data = nullptr;
+        other.sz = 0;
+    }
+
+    ~Vector() { delete[] data; }
+
+    // 2. Operatori dodele
+    Vector& operator=(const Vector& other) {
+        if (this != &other) {
+            T* newData = new T[other.sz];
+            for (size_t i = 0; i < other.sz; ++i) newData[i] = other.data[i];
+            delete[] data;
+            data = newData;
+            sz = other.sz;
+        }
+        return *this;
+    }
+
+    Vector& operator=(Vector&& other) noexcept {
+        if (this != &other) {
+            delete[] data;
+            data = other.data;
+            sz = other.sz;
+            other.data = nullptr;
+            other.sz = 0;
+        }
+        return *this;
+    }
+
+    // 3. Paralelizovani operator sabiranja (+)
+    Vector operator+(const Vector& other) const {
+        Vector result(sz);
+        unsigned int num_threads = std::thread::hardware_concurrency();
+        if (num_threads == 0) num_threads = 2;
+
+        std::vector<std::thread> threads;
+        size_t chunk = sz / num_threads;
+
+        for (unsigned int i = 0; i < num_threads; ++i) {
+            size_t start = i * chunk;
+            size_t end = (i == num_threads - 1) ? sz : (i + 1) * chunk;
+            threads.emplace_back(parallel_add, data, other.data, result.data, start, end);
+        }
+
+        for (auto& t : threads) t.join();
+        return result;
+    }
+
+    // 4. Paralelizovani operator dekrementiranja (--) - Prefix
+    Vector& operator--() {
+        unsigned int num_threads = std::thread::hardware_concurrency();
+        std::vector<std::thread> threads;
+        size_t chunk = sz / num_threads;
+
+        for (unsigned int i = 0; i < num_threads; ++i) {
+            size_t start = i * chunk;
+            size_t end = (i == num_threads - 1) ? sz : (i + 1) * chunk;
+            threads.emplace_back([this, start, end]() {
+                for (size_t j = start; j < end; ++j) --data[j];
+            });
+        }
+        for (auto& t : threads) t.join();
+        return *this;
+    }
+
+    // 5. Paralelizovana Euklidova norma
+    double norm() const {
+        unsigned int num_threads = std::thread::hardware_concurrency();
+        std::vector<std::thread> threads;
+        std::vector<T> partial_sums(num_threads);
+        size_t chunk = sz / num_threads;
+
+        for (unsigned int i = 0; i < num_threads; ++i) {
+            size_t start = i * chunk;
+            size_t end = (i == num_threads - 1) ? sz : (i + 1) * chunk;
+            threads.emplace_back(parallel_norm_sq, data, start, end, std::ref(partial_sums[i]));
+        }
+
+        T total_sq = 0;
+        for (unsigned int i = 0; i < num_threads; ++i) {
+            threads[i].join();
+            total_sq += partial_sums[i];
+        }
+
+        return std::sqrt(static_cast<double>(total_sq));
+    }
+
+    // Pomoćne funkcije
+    size_t size() const { return sz; }
+    T& operator[](size_t i) { return data[i]; }
+};
+
+// A) Implementirati šablon klase Matrica. Matriocu alocirati kao kontinualni niz memorijskih lokacija dužine nx*ny, pri čemu je nx broj redova a ny broj kolona. Napisati copy i  move konstruktore, copy i move operatore dodele, i destruktor. Preklopiti operator indeksiranja matrice tako da sledeće linije koda budu validne.
+// Matrica<int> m(3,4);
+// m[1][0]=4;
+// B) Preklomiti i paralelizovati operator sabiranja i operator pokomponentnog množenja matrica. Implementirati i paralelizovati nalaženje sume elemenata matrice.
+
+#include <iostream>
+#include <thread>
+#include <vector>
+
+template <typename T>
+class Matrica {
+private:
+    T* data;
+    size_t rows;
+    size_t cols;
+
+    // Pomoćna funkcija koristi šablon F (duck typing) umesto std::function
+    template <typename F>
+    void parallel_apply(F func) const {
+        unsigned int num_threads = std::thread::hardware_concurrency();
+        if (num_threads == 0) num_threads = 2;
+        
+        std::vector<std::thread> threads;
+        size_t total_elements = rows * cols;
+        size_t chunk = total_elements / num_threads;
+
+        for (unsigned int i = 0; i < num_threads; ++i) {
+            size_t start = i * chunk;
+            size_t end = (i == num_threads - 1) ? total_elements : (i + 1) * chunk;
+            
+            if (start < end)
+                threads.emplace_back(func, start, end);
+        }
+        for (auto& t : threads) t.join();
+    }
+
+public:
+    // Konstruktor - alocira kontinualni niz nx * ny
+    Matrica(size_t r, size_t c) : rows(r), cols(c), data(new T[r * c]{}) {}
+
+    // 1. Destruktor
+    ~Matrica() { 
+        delete[] data; 
+    }
+
+    // 2. Copy Konstruktor
+    Matrica(const Matrica& other) : rows(other.rows), cols(other.cols), data(new T[other.rows * other.cols]) {
+        for (size_t i = 0; i < rows * cols; ++i) data[i] = other.data[i];
+    }
+
+    // 3. Move Konstruktor
+    Matrica(Matrica&& other) noexcept : data(other.data), rows(other.rows), cols(other.cols) {
+        other.data = nullptr;
+        other.rows = 0;
+        other.cols = 0;
+    }
+
+    // 4. Copy Operator dodele
+    Matrica& operator=(const Matrica& other) {
+        if (this != &other) {
+            T* newData = new T[other.rows * other.cols];
+            for (size_t i = 0; i < other.rows * other.cols; ++i) newData[i] = other.data[i];
+            delete[] data;
+            data = newData;
+            rows = other.rows;
+            cols = other.cols;
+        }
+        return *this;
+    }
+
+    // 5. Move Operator dodele
+    Matrica& operator=(Matrica&& other) noexcept {
+        if (this != &other) {
+            delete[] data;
+            data = other.data;
+            rows = other.rows;
+            cols = other.cols;
+            other.data = nullptr;
+            other.rows = 0;
+            other.cols = 0;
+        }
+        return *this;
+    }
+
+    // 6. Operator indeksiranja m[i][j]
+    // Vraća pokazivač na početak i-tog reda, omogućavajući drugi [] operator
+    T* operator[](size_t row_idx) { 
+        return &data[row_idx * cols]; 
+    }
+    
+    const T* operator[](size_t row_idx) const { 
+        return &data[row_idx * cols]; 
+    }
+
+    // 7. Paralelizovano sabiranje (+)
+    Matrica operator+(const Matrica& other) const {
+        Matrica res(rows, cols);
+        this->parallel_apply([&](size_t start, size_t end) {
+            for (size_t i = start; i < end; ++i) 
+                res.data[i] = this->data[i] + other.data[i];
+        });
+        return res;
+    }
+
+    // 8. Paralelizovano pokomponentno množenje (*)
+    Matrica operator*(const Matrica& other) const {
+        Matrica res(rows, cols);
+        this->parallel_apply([&](size_t start, size_t end) {
+            for (size_t i = start; i < end; ++i) 
+                res.data[i] = this->data[i] * other.data[i];
+        });
+        return res;
+    }
+
+    // 9. Paralelizovana suma elemenata
+    T suma() const {
+        unsigned int num_threads = std::thread::hardware_concurrency();
+        if (num_threads == 0) num_threads = 2;
+
+        std::vector<T> parcijalne_sume(num_threads, 0);
+        size_t total_elements = rows * cols;
+        size_t chunk = total_elements / num_threads;
+        std::vector<std::thread> threads;
+
+        for (unsigned int i = 0; i < num_threads; ++i) {
+            size_t start = i * chunk;
+            size_t end = (i == num_threads - 1) ? total_elements : (i + 1) * chunk;
+            
+            threads.emplace_back([this, start, end, &parcijalne_sume, i]() {
+                T lokalna_suma = 0;
+                for (size_t j = start; j < end; ++j) 
+                    lokalna_suma += data[j];
+                parcijalne_sume[i] = lokalna_suma;
+            });
+        }
+
+        T ukupna_suma = 0;
+        for (unsigned int i = 0; i < num_threads; ++i) {
+            threads[i].join();
+            ukupna_suma += parcijalne_sume[i];
+        }
+        return ukupna_suma;
+    }
+
+    // Pomoćne funkcije za proveru
+    size_t getRows() const { return rows; }
+    size_t getCols() const { return cols; }
+};
+
+// A) Implementirati šablon klase Vektor. Vektor alocirati kao kontinualni niz memorijskih lokacija dužine nx, pri čemu je nx dužina vektora, parametar šablona. Napisati copy i move konstruktore, copy i move operatore dodele i destruktor. Preklopiti operatore indeksiranja Vektora.
+// B) Preklopiti i paralelizovati operator sabiranja i operator pokomponentnog množenja vektora. Implementirati i paralelizovati skalarni proizvod vektora
+
+#include <iostream>
+#include <thread>
+#include <vector>
+
+template <typename T, size_t nx>
+class Vektor {
+private:
+    T data[nx]; // Kontinualni niz fiksne dužine definisane šablonom
+
+public:
+    // 1. Konstruktori
+    Vektor() {
+        for (size_t i = 0; i < nx; ++i) data[i] = T();
+    }
+
+    // Konstruktor sa inicijalizacijom (pomoćni)
+    Vektor(T value) {
+        for (size_t i = 0; i < nx; ++i) data[i] = value;
+    }
+
+    // Copy konstruktor
+    Vektor(const Vektor& other) {
+        for (size_t i = 0; i < nx; ++i) data[i] = other.data[i];
+    }
+
+    // Move konstruktor (kod statičkih nizova move je isto što i copy)
+    Vektor(Vektor&& other) noexcept {
+        for (size_t i = 0; i < nx; ++i) data[i] = std::move(other.data[i]);
+    }
+
+    // Destruktor (prazan jer nema dinamičke memorije na heap-u)
+    ~Vektor() = default;
+
+    // 2. Operatori dodele
+    Vektor& operator=(const Vektor& other) {
+        if (this != &other) {
+            for (size_t i = 0; i < nx; ++i) data[i] = other.data[i];
+        }
+        return *this;
+    }
+
+    Vektor& operator=(Vektor&& other) noexcept {
+        if (this != &other) {
+            for (size_t i = 0; i < nx; ++i) data[i] = std::move(other.data[i]);
+        }
+        return *this;
+    }
+
+    // 3. Operatori indeksiranja
+    T& operator[](size_t i) { return data[i]; }
+    const T& operator[](size_t i) const { return data[i]; }
+
+    // 4. Paralelizovano sabiranje (+)
+    Vektor operator+(const Vektor& other) const {
+        Vektor res;
+        unsigned int num_threads = std::thread::hardware_concurrency();
+        std::vector<std::thread> threads;
+        size_t chunk = nx / num_threads;
+
+        for (unsigned int i = 0; i < num_threads; ++i) {
+            size_t start = i * chunk;
+            size_t end = (i == num_threads - 1) ? nx : (i + 1) * chunk;
+            threads.emplace_back([this, &other, &res, start, end]() {
+                for (size_t j = start; j < end; ++j) res.data[j] = this->data[j] + other.data[j];
+            });
+        }
+        for (auto& t : threads) t.join();
+        return res;
+    }
+
+    // 5. Paralelizovano pokomponentno množenje (*)
+    Vektor operator*(const Vektor& other) const {
+        Vektor res;
+        unsigned int num_threads = std::thread::hardware_concurrency();
+        std::vector<std::thread> threads;
+        size_t chunk = nx / num_threads;
+
+        for (unsigned int i = 0; i < num_threads; ++i) {
+            size_t start = i * chunk;
+            size_t end = (i == num_threads - 1) ? nx : (i + 1) * chunk;
+            threads.emplace_back([this, &other, &res, start, end]() {
+                for (size_t j = start; j < end; ++j) res.data[j] = this->data[j] * other.data[j];
+            });
+        }
+        for (auto& t : threads) t.join();
+        return res;
+    }
+
+    // 6. Paralelizovani skalarni proizvod (Dot Product)
+    T skalarni_proizvod(const Vektor& other) const {
+        unsigned int num_threads = std::thread::hardware_concurrency();
+        if (num_threads == 0) num_threads = 2;
+        
+        std::vector<T> partial_results(num_threads, 0);
+        std::vector<std::thread> threads;
+        size_t chunk = nx / num_threads;
+
+        for (unsigned int i = 0; i < num_threads; ++i) {
+            size_t start = i * chunk;
+            size_t end = (i == num_threads - 1) ? nx : (i + 1) * chunk;
+            threads.emplace_back([this, &other, &partial_results, i, start, end]() {
+                T sum = 0;
+                for (size_t j = start; j < end; ++j) {
+                    sum += this->data[j] * other.data[j];
+                }
+                partial_results[i] = sum;
+            });
+        }
+
+        T total_dot_product = 0;
+        for (unsigned int i = 0; i < num_threads; ++i) {
+            threads[i].join();
+            total_dot_product += partial_results[i];
+        }
+        return total_dot_product;
+    }
+};
+
+// DRUGI ZADACI
+
+// Paralelizovati inicijalizaciju dvodimenziionalnog polja vrednostima iz Gausove raspodele. Paralelizovati izračunavanje srednjih vrednosti elemnata unutar zadatih intervala. Granice intervala su definisane brojem intervala, koji predstavlja parametar koji se zadaje.
+#include <iostream>
+#include <vector>
+#include <thread>
+#include <random>
+#include <cmath>
+
+class GaussianMatrix {
+private:
+    size_t rows, cols;
+    double* data;
+
+public:
+    GaussianMatrix(size_t r, size_t c) : rows(r), cols(c), data(new double[r * c]) {}
+    ~GaussianMatrix() { delete[] data; }
+
+    // 1. Paralelna inicijalizacija (bez promena, ovo je standardan pristup)
+    void parallel_initialize(double mean, double std_dev) {
+        unsigned int num_threads = std::thread::hardware_concurrency();
+        std::vector<std::thread> threads;
+        size_t total_size = rows * cols;
+        size_t chunk = total_size / num_threads;
+
+        for (unsigned int i = 0; i < num_threads; ++i) {
+            size_t start = i * chunk;
+            size_t end = (i == num_threads - 1) ? total_size : (i + 1) * chunk;
+
+            threads.emplace_back([this, start, end, mean, std_dev, i]() {
+                std::mt19937 gen(1337 + i); // Fiksni seed za predvidljivost
+                std::normal_distribution<double> dist(mean, std_dev);
+                for (size_t j = start; j < end; ++j) data[j] = dist(gen);
+            });
+        }
+        for (auto& t : threads) t.join();
+    }
+
+    // 2. Paralelizovano računanje srednjih vrednosti po intervalima
+    std::vector<double> parallel_interval_means(int num_intervals) {
+        size_t total_size = rows * cols;
+        unsigned int num_threads = std::thread::hardware_concurrency();
+        
+        // --- KORAK A: Paralelno nalaženje MIN i MAX (umesto std::min_element) ---
+        std::vector<double> thread_mins(num_threads, data[0]);
+        std::vector<double> thread_maxs(num_threads, data[0]);
+        std::vector<std::thread> range_threads;
+        size_t chunk = total_size / num_threads;
+
+        for (unsigned int t = 0; t < num_threads; ++t) {
+            size_t start = t * chunk;
+            size_t end = (t == num_threads - 1) ? total_size : (t + 1) * chunk;
+            range_threads.emplace_back([this, t, start, end, &thread_mins, &thread_maxs]() {
+                double l_min = data[start];
+                double l_max = data[start];
+                for (size_t j = start + 1; j < end; ++j) {
+                    if (data[j] < l_min) l_min = data[j];
+                    if (data[j] > l_max) l_max = data[j];
+                }
+                thread_mins[t] = l_min;
+                thread_maxs[t] = l_max;
+            });
+        }
+        for (auto& t : range_threads) t.join();
+
+        double global_min = thread_mins[0], global_max = thread_maxs[0];
+        for (unsigned int i = 1; i < num_threads; ++i) {
+            if (thread_mins[i] < global_min) global_min = thread_mins[i];
+            if (thread_maxs[i] > global_max) global_max = thread_maxs[i];
+        }
+
+        // --- KORAK B: Paralelno punjenje intervala (histogramiranje) ---
+        double interval_width = (global_max - global_min) / num_intervals;
+        if (interval_width == 0) interval_width = 1.0;
+
+        std::vector<std::vector<double>> thread_sums(num_threads, std::vector<double>(num_intervals, 0.0));
+        std::vector<std::vector<size_t>> thread_counts(num_threads, std::vector<size_t>(num_intervals, 0));
+        std::vector<std::thread> work_threads;
+
+        for (unsigned int t = 0; t < num_threads; ++t) {
+            size_t start = t * chunk;
+            size_t end = (t == num_threads - 1) ? total_size : (t + 1) * chunk;
+            work_threads.emplace_back([&, t, start, end]() {
+                for (size_t j = start; j < end; ++j) {
+                    int bin = static_cast<int>((data[j] - global_min) / interval_width);
+                    if (bin >= num_intervals) bin = num_intervals - 1;
+                    if (bin < 0) bin = 0;
+
+                    thread_sums[t][bin] += data[j];
+                    thread_counts[t][bin]++;
+                }
+            });
+        }
+        for (auto& t : work_threads) t.join();
+
+        // --- KORAK C: Finalna redukcija ---
+        std::vector<double> results(num_intervals);
+        for (int b = 0; b < num_intervals; ++b) {
+            double total_sum = 0;
+            size_t total_count = 0;
+            for (unsigned int t = 0; t < num_threads; ++t) {
+                total_sum += thread_sums[t][b];
+                total_count += thread_counts[t][b];
+            }
+            results[b] = (total_count > 0) ? (total_sum / total_count) : 0.0;
+        }
+
+        return results;
+    }
+};
+
+// Paralelizovati izračunavanje histograma RGB slike. Slika je implementirana sa 3 matrice piksela (unsigned char) boja (Red, Green, Blue), konkatenisanih u jedan kontinualni niz vrednosti. Rezultat izračunavanja je niz koji predstavlja tri konkatenisana histograma (po jedan za svaku boju). Dimenzije slike (visina i širina), kao i broj elemnata histograma su parametri čije se vrednosti zadaju.
+#include <iostream>
+#include <vector>
+#include <thread>
+
+class RGBImage {
+private:
+    size_t width, height;
+    unsigned char* data; // Kontinualni niz: R-ravan, pa G-ravan, pa B-ravan
+
+public:
+    RGBImage(size_t w, size_t h) : width(w), height(h), data(new unsigned char[3 * w * h]) {}
+    ~RGBImage() { delete[] data; }
+
+    // Funkcija za pristup podacima (radi testiranja)
+    unsigned char* get_data() { return data; }
+
+    std::vector<size_t> calculate_histogram(int num_bins) {
+        size_t plane_size = width * height;
+        size_t total_size = 3 * plane_size; // Ukupno elemenata u nizu
+        
+        unsigned int num_threads = std::thread::hardware_concurrency();
+        if (num_threads == 0) num_threads = 2;
+
+        // Svaka nit ima svoj lokalni histogram pune veličine (3 * num_bins)
+        // thread_histograms[nit][bin_index]
+        std::vector<std::vector<size_t>> thread_histograms(num_threads, std::vector<size_t>(3 * num_bins, 0));
+
+        std::vector<std::thread> threads;
+        size_t chunk = total_size / num_threads;
+
+        // Faktor skaliranja vrednosti (0-255) u broj binova
+        double bin_scale = static_cast<double>(num_bins) / 256.0;
+
+        for (unsigned int t = 0; t < num_threads; ++t) {
+            size_t start = t * chunk;
+            size_t end = (t == num_threads - 1) ? total_size : (t + 1) * chunk;
+
+            threads.emplace_back([this, t, start, end, &thread_histograms, plane_size, num_bins, bin_scale]() {
+                for (size_t i = start; i < end; ++i) {
+                    // Određujemo kojoj boji (ravni) pripada trenutni indeks
+                    int color_idx = i / plane_size; // 0 za R, 1 za G, 2 za B
+                    
+                    // Izračunavamo bin unutar te boje
+                    int bin = static_cast<int>(data[i] * bin_scale);
+                    if (bin >= num_bins) bin = num_bins - 1;
+
+                    // Globalni indeks u histogramu (konkatenisani histogrami)
+                    int final_bin_idx = (color_idx * num_bins) + bin;
+                    
+                    thread_histograms[t][final_bin_idx]++;
+                }
+            });
+        }
+
+        for (auto& t_obj : threads) t_obj.join();
+
+        // REDUKCIJA: Spajanje lokalnih histograma u jedan finalni
+        std::vector<size_t> final_histogram(3 * num_bins, 0);
+        for (int b = 0; b < 3 * num_bins; ++b) {
+            for (unsigned int t = 0; t < num_threads; ++t) {
+                final_histogram[b] += thread_histograms[t][b];
+            }
+        }
+
+        return final_histogram;
+    }
+};
+
+// Paraleizovati izračunavanje histograma GRAY sike. Slika je implementirana kao matrica piksela (unsigned char), linearizovana u kontinualni niz vrednosti. Rezultat izračunavanja je niz, koji predstavlja histogram. Dimenzije slike (visina i širina), kao i broj elemnata histograma su parametri čije se vrednosti zadaju.
+#include <iostream>
+#include <vector>
+#include <thread>
+
+class GrayImage {
+private:
+    size_t width, height;
+    unsigned char* data; // Linearizovani niz piksela (0-255)
+
+public:
+    GrayImage(size_t w, size_t h) : width(w), height(h), data(new unsigned char[w * h]) {}
+    ~GrayImage() { delete[] data; }
+
+    // Pomoćna funkcija za popunjavanje podataka (za testiranje)
+    unsigned char* get_data() { return data; }
+
+    std::vector<size_t> calculate_histogram(int num_bins) {
+        size_t total_pixels = width * height;
+        unsigned int num_threads = std::thread::hardware_concurrency();
+        if (num_threads == 0) num_threads = 2;
+
+        // Svaka nit ima svoj privatni histogram da bi se izbeglo zaključavanje (False Sharing)
+        std::vector<std::vector<size_t>> thread_histograms(num_threads, std::vector<size_t>(num_bins, 0));
+
+        std::vector<std::thread> threads;
+        size_t chunk = total_pixels / num_threads;
+
+        // Faktor skaliranja: vrednost 0-255 se preslikava u opseg 0-(num_bins-1)
+        double bin_scale = static_cast<double>(num_bins) / 256.0;
+
+        for (unsigned int t = 0; t < num_threads; ++t) {
+            size_t start = t * chunk;
+            size_t end = (t == num_threads - 1) ? total_pixels : (t + 1) * chunk;
+
+            threads.emplace_back([this, t, start, end, &thread_histograms, bin_scale, num_bins]() {
+                for (size_t i = start; i < end; ++i) {
+                    // Izračunavanje u koji bin upada intenzitet piksela
+                    int bin = static_cast<int>(data[i] * bin_scale);
+                    
+                    // Sigurnosna provera granica
+                    if (bin >= num_bins) bin = num_bins - 1;
+                    
+                    // Inkrementiranje lokalnog histograma niti
+                    thread_histograms[t][bin]++;
+                }
+            });
+        }
+
+        // Čekanje da sve niti završe posao
+        for (auto& t_obj : threads) t_obj.join();
+
+        // REDUKCIJA: Sabiranje lokalnih rezultata u finalni histogram
+        std::vector<size_t> final_histogram(num_bins, 0);
+        for (int b = 0; b < num_bins; ++b) {
+            for (unsigned int t = 0; t < num_threads; ++t) {
+                final_histogram[b] += thread_histograms[t][b];
+            }
+        }
+
+        return final_histogram;
+    }
+};
+
+// TRECI ZADACI
+
+// Za šablon Scalar<T> i std::vector skalara paralelizovati nalaženje maksimalne vrednosti. Preklopiti odgovarajući operator u skalaru. Za nalaženje maksimalne vrednosti definisati korisničku redukciju.
+#include <iostream>
+#include <vector>
+#include <thread>
+
+// 1. Šablon klase Scalar sa preklopljenim operatorom
+template <typename T>
+class Scalar {
+private:
+    T value;
+public:
+    Scalar(T v = T()) : value(v) {}
+    
+    // Preklapanje operatora za poređenje (neophodno za max)
+    bool operator>(const Scalar& other) const {
+        return value > other.value;
+    }
+
+    T getValue() const { return value; }
+};
+
+// 2. Funkcija za nalaženje maksimuma pomoću korisničke redukcije
+template <typename T>
+Scalar<T> find_max_parallel(const std::vector<Scalar<T>>& vec) {
+    size_t n = vec.size();
+    if (n == 0) return Scalar<T>();
+
+    unsigned int num_threads = std::thread::hardware_concurrency();
+    if (num_threads == 0) num_threads = 2;
+
+    // Vektor za čuvanje lokalnih maksimuma iz svake niti
+    std::vector<Scalar<T>> local_maxima(num_threads, vec[0]);
+    std::vector<std::thread> threads;
+    size_t chunk = n / num_threads;
+
+    for (unsigned int i = 0; i < num_threads; ++i) {
+        size_t start = i * chunk;
+        size_t end = (i == num_threads - 1) ? n : (i + 1) * chunk;
+
+        threads.emplace_back([&vec, &local_maxima, i, start, end]() {
+            // Korisnička redukcija: lokalno nalaženje maksimuma
+            Scalar<T> current_max = vec[start];
+            for (size_t j = start + 1; j < end; ++j) {
+                if (vec[j] > current_max) { // Koristi naš preklopljeni operator
+                    current_max = vec[j];
+                }
+            }
+            local_maxima[i] = current_max;
+        });
+    }
+
+    // Čekanje da sve niti završe
+    for (auto& t : threads) t.join();
+
+    // Finalna redukcija: nalaženje maksimuma među lokalnim maksimumima
+    Scalar<T> global_max = local_maxima[0];
+    for (unsigned int i = 1; i < num_threads; ++i) {
+        if (local_maxima[i] > global_max) {
+            global_max = local_maxima[i];
+        }
+    }
+
+    return global_max;
+}
+
+// Za šablon Value<T> (objekti instance šablona sadrže kao podatak vrednost tipa T) i std::vector objekata instanciranog šablona Number<T>, paralelizovati nalaženje minimalne apsolutne vrednosti ovih objekata. Definisati korisničku redukciju za nalaženje minimalne apsolutne vrednosti. Preklopiti potrebne operatore poređenja u šablonu Value<T>.
+#include <iostream>
+#include <vector>
+#include <thread>
+#include <cmath> // Za std::abs
+
+template <typename T>
+class Value {
+private:
+    T val;
+
+public:
+    Value(T v = T()) : val(v) {}
+
+    T get() const { return val; }
+
+    // Pomoćna funkcija za dobijanje apsolutne vrednosti
+    auto abs_val() const {
+        // Koristimo std::abs, ali pazimo na tipove
+        if constexpr (std::is_unsigned_v<T>) return val;
+        else return std::abs(val);
+    }
+
+    // Preklapanje operatora < na osnovu apsolutne vrednosti
+    // Ovo je ključno za našu redukciju
+    bool operator<(const Value& other) const {
+        return this->abs_val() < other.abs_val();
+    }
+};
+
+// Funkcija za nalaženje minimalne apsolutne vrednosti
+template <typename T>
+Value<T> find_min_abs_parallel(const std::vector<Value<T>>& data) {
+    if (data.empty()) return Value<T>();
+
+    unsigned int num_threads = std::thread::hardware_concurrency();
+    if (num_threads == 0) num_threads = 2;
+
+    size_t n = data.size();
+    size_t chunk = n / num_threads;
+    
+    // Čuvamo lokalne minimume svake niti
+    std::vector<Value<T>> local_minima(num_threads, data[0]);
+    std::vector<std::thread> threads;
+
+    for (unsigned int i = 0; i < num_threads; ++i) {
+        size_t start = i * chunk;
+        size_t end = (i == num_threads - 1) ? n : (i + 1) * chunk;
+
+        threads.emplace_back([&data, &local_minima, i, start, end]() {
+            Value<T> current_min = data[start];
+            for (size_t j = start + 1; j < end; ++j) {
+                // Korisnička redukcija: poredimo apsolutne vrednosti 
+                // koristeći preklopljeni operator <
+                if (data[j] < current_min) {
+                    current_min = data[j];
+                }
+            }
+            local_minima[i] = current_min;
+        });
+    }
+
+    for (auto& t : threads) t.join();
+
+    // Finalni korak redukcije: spajanje lokalnih rezultata
+    Value<T> global_min = local_minima[0];
+    for (unsigned int i = 1; i < num_threads; ++i) {
+        if (local_minima[i] < global_min) {
+            global_min = local_minima[i];
+        }
+    }
+
+    return global_min;
+}
+
+// TRECI ZADATAK GLUPAV
+
+/* Dat je deo implementacije šablona matrice.
+template<typename T>
+class matrix{
+private:
+	long long _n_rows, _n_cols;
+	T *_array;
+public:
+}
+matrix(long long n_rows, long long n_cols):
+	_n_rows(n_rows), _n_cols(n_cols),\array(new T[_n_rows* _n_cols]) {}
+~matrix(){ delete[] _array;}
+...
+};
+
+A) Paralelizovati Hadamard-ov (pokomponentni) zbir matrica, "manuelnom" podelom matrica na "chunk"-ove i kreiranjem zadatka za svaki "chunk".
+B) Paralelizovati Hadamard-ov zbir matrica koristeći tasklloop sa klauzulom numtasks.
+*/
+
+// A)
+void hadamard_manual_chunks(const matrix<T>& B, matrix<T>& C, int num_chunks) {
+    long long total_size = _n_rows * _n_cols;
+    long long chunk_size = total_size / num_chunks;
+
+    #pragma omp parallel
+    {
+        #pragma omp single
+        {
+            for (int i = 0; i < num_chunks; i++) {
+                long long start = i * chunk_size;
+                // Osiguravamo da poslednji chunk pokrije sve do kraja
+                long long end = (i == num_chunks - 1) ? total_size : (i + 1) * chunk_size;
+
+                #pragma omp task firstprivate(start, end)
+                {
+                    for (long long j = start; j < end; j++) {
+                        C._array[j] = _array[j] + B._array[j];
+                    }
+                }
+            }
+        }
+    }
+}
+
+// B)
+void hadamard_taskloop(const matrix<T>& B, matrix<T>& C, int n_tasks) {
+    long long total_size = _n_rows * _n_cols;
+
+    #pragma omp parallel
+    {
+        #pragma omp single
+        {
+            #pragma omp taskloop num_tasks(n_tasks)
+            for (long long i = 0; i < total_size; i++) {
+                C._array[i] = _array[i] + B._array[i];
+            }
+        }
+    }
+}
+
+// CETVRTI ZADACI
+
+/*
+Koristeći biblioteku MPI kreirati 4 procesa.
+1. Proces kreira 3 slučajna float broja
+2. Proces kreira 1 slučajan float broj
+3. Proces kreira 1 slučajan float broj
+4. Proces kreira 2 slučajna float broja
+Prikupiti brojeve u linearnu strukturu u svakom procesu sa sledećim lokacijama.
+Iz 1. Procesa na indekse [0,2,4]
+Iz 2. Procesa na indeks[5]
+Iz 3. Procesa na indeks[6]
+Iz 4. Procesa na indekse [7,8]
+*/
+
+#include <iostream>
+#include <vector>
+#include <mpi.h>
+#include <ctime>
+#include <cstdlib>
+
+int main(int argc, char** argv) {
+    MPI_Init(&argc, &argv);
+
+    int world_size, rank;
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+    if (world_size != 4) {
+        if (rank == 0) std::cerr << "Ovaj program zahteva tacno 4 procesa." << std::endl;
+        MPI_Finalize();
+        return 1;
+    }
+
+    // Inicijalizacija generatora slučajnih brojeva
+    srand(time(NULL) + rank);
+
+    std::vector<float> local_data;
+    int send_count = 0;
+
+    // 1. Definisanje broja podataka po procesu
+    if (rank == 0) send_count = 3;
+    else if (rank == 1) send_count = 1;
+    else if (rank == 2) send_count = 1;
+    else if (rank == 3) send_count = 2;
+
+    // 2. Kreiranje slučajnih float brojeva
+    for (int i = 0; i < send_count; ++i) {
+        local_data.push_back(static_cast<float>(rand()) / static_cast<float>(RAND_MAX));
+    }
+
+    // 3. Priprema za prikupljanje (samo na root procesu)
+    std::vector<float> global_buffer;
+    if (rank == 0) {
+        global_buffer.resize(9, -1.0f); // Niz od 9 elemenata (indeksi idu do 8)
+    }
+
+    // 4. Prikupljanje podataka
+    // Koristicemo MPI_Send i MPI_Recv za precizno smestanje na tacne indekse
+    if (rank != 0) {
+        // Ostali procesi salju svoje podatke procesu 0
+        MPI_Send(local_data.data(), send_count, MPI_FLOAT, 0, 0, MPI_COMM_WORLD);
+    } else {
+        // Proces 0 smesta svoje podatke na indekse [0, 2, 4]
+        global_buffer[0] = local_data[0];
+        global_buffer[2] = local_data[1];
+        global_buffer[4] = local_data[2];
+
+        // Proces 0 prima od ostalih i smesta na tacne pozicije
+        float temp[2]; // Privremeni bafer za prijem
+
+        // Od procesa 1 -> indeks [5]
+        MPI_Recv(&global_buffer[5], 1, MPI_FLOAT, 1, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        
+        // Od procesa 2 -> indeks [6]
+        MPI_Recv(&global_buffer[6], 1, MPI_FLOAT, 2, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        
+        // Od procesa 3 -> indeksi [7, 8]
+        MPI_Recv(&global_buffer[7], 2, MPI_FLOAT, 3, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    }
+
+    // 5. Slanje finalnog niza svim procesima (opciono, da bi "svaki proces" imao strukturu)
+    MPI_Bcast(global_buffer.data(), 9, MPI_FLOAT, 0, MPI_COMM_WORLD);
+
+    // Prikaz rezultata na svakom procesu
+    std::cout << "Proces " << rank << " finalni niz: ";
+    for (float f : global_buffer) std::cout << f << " ";
+    std::cout << std::endl;
+
+    MPI_Finalize();
+    return 0;
+}
+
+/*
+Koristeći biblioteku MPI kreirati 3 procesa.
+1. proces kreira 2 slučajna int broja
+2. proces kreira 1 slučajan int broj
+3. proces kreira 3 slučajna int broja
+Prikupiti brojeve u linearnu strukturu u svakom procesu sa sledećim lokacijama.
+Iz 1. procesa na indekse [0,3]
+Iz 2. procesa na indeks [5]
+Iz 3. procesa na indeks [6,9,11]
+*/
+
+#include <iostream>
+#include <vector>
+#include <mpi.h>
+#include <ctime>
+#include <cstdlib>
+
+int main(int argc, char** argv) {
+    MPI_Init(&argc, &argv);
+
+    int world_size, rank;
+    MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+
+    // Provera broja procesa
+    if (world_size != 3) {
+        if (rank == 0) std::cerr << "Greska: Program zahteva tacno 3 procesa!" << std::endl;
+        MPI_Finalize();
+        return 1;
+    }
+
+    // Inicijalizacija random generatora (razlicit seed za svaki proces)
+    srand(time(NULL) + rank);
+
+    // 1. Kreiranje lokalnih podataka
+    std::vector<int> local_data;
+    if (rank == 0) {
+        local_data = {rand() % 100, rand() % 100}; // 2 broja
+    } else if (rank == 1) {
+        local_data = {rand() % 100};               // 1 broj
+    } else if (rank == 2) {
+        local_data = {rand() % 100, rand() % 100, rand() % 100}; // 3 broja
+    }
+
+    // 2. Priprema linearne strukture (velicina 12 jer je najveci indeks 11)
+    std::vector<int> final_structure(12, 0); 
+
+    // 3. Prikupljanje podataka kod procesa 0
+    if (rank == 0) {
+        // Podaci procesa 0 idu na indekse [0, 3]
+        final_structure[0] = local_data[0];
+        final_structure[3] = local_data[1];
+
+        // Primanje od procesa 1 na indeks [5]
+        MPI_Recv(&final_structure[5], 1, MPI_INT, 1, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+        // Primanje od procesa 2 na indekse [6, 9, 11]
+        // Posto nisu povezani, primamo ih jedan po jedan ili u privremeni bafer
+        int temp[3];
+        MPI_Recv(temp, 3, MPI_INT, 2, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        final_structure[6]  = temp[0];
+        final_structure[9]  = temp[1];
+        final_structure[11] = temp[2];
+
+    } else {
+        // Procesi 1 i 2 salju svoje podatke procesu 0
+        MPI_Send(local_data.data(), local_data.size(), MPI_INT, 0, 0, MPI_COMM_WORLD);
+    }
+
+    // 4. Slanje popunjene strukture svim procesima (da bi je svaki proces imao)
+    MPI_Bcast(final_structure.data(), 12, MPI_INT, 0, MPI_COMM_WORLD);
+
+    // Ispis rezultata da potvrdimo lokacije
+    std::string output = "Proces " + std::to_string(rank) + " niz: [ ";
+    for (int val : final_structure) output += std::to_string(val) + " ";
+    output += "]\n";
+    std::cout << output;
+
+    MPI_Finalize();
+    return 0;
+}
