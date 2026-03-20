@@ -1,0 +1,1213 @@
+// Napisati funkciju koja pronalazi minimalni element niza (std::vector) koristeći veći broj niti. Koristiti std::async, std::future, std::min_element.
+// Bonus: +2 poena, omogućiti da funkcija radi sa proizvoljnim načinom definisanja operatora < (koristiti verziju sted::min_element() funkcije sa 3 argumenta). Testirati na primeru poređenja po apsolutnoj vrednosti.
+
+#include <iostream>
+#include <thread>
+#include <future>
+#include <chrono>
+#include <vector>
+#include <math.h>
+#include <ctime>
+
+using namespace std;
+
+template<typename IterT, typename Func> // IterT jer koristimo iterator pa mora se napise a Func sam stavio jer
+									   // Zadatak zahteva sa moze napises koji oces komparator (pogledaj zadatak) koji ce bude funkcija 
+typename IterT::value_type min_elem(IterT begin, IterT end, Func komp, int num_threads = 4) {
+	using T = typename IterT::value_type; // ovo bukvalno govori T ce da bude tip koji je IterT::value_type bukv ako koristis vector<int> i kada pozovemo njegov komparator on ce bude int vrednosti pa tako mora i rezultat da bude
+	int n = distance(begin, end); // moze se n stavi ko parametar al nije tako radio na cas pa ajde
+	int work_per_thread = (n + num_threads - 1) / num_threads;
+	vector<future<IterT>> futures(num_threads - 1); // u futures idu rezultati ali posto min i max_element vracaju Iteratore (pokazivac) mi mora stavimo da nam je future to kako bi dobili broj
+	vector<T> results(num_threads);
+	for (int i = 0; i < num_threads - 1; i++)
+	{
+		IterT kraj = begin;
+		advance(kraj, work_per_thread);
+		futures[i] = async(launch::async, [=]() { // razlika izmedju cas i ovaj zadatak je ovo efikasnije je i lakse za pisanje bukvalno lambda izraz das mu sve iz funkciju jer imamo [=]
+			return min_element(begin, kraj, komp);// i onda mu samo vratis funkciju zapamti ovo moze se uvek koristi
+			});
+		begin = kraj;
+	}
+	results[num_threads - 1] = *min_element(begin, end, komp); // malo glupo ali tako je na cas radio pa ajde umesto da ide u future ti mu odma uzmes rezultat
+
+	for (int i = 0; i < num_threads - 1; i++)
+	{
+		results[i] = *(futures[i].get()); // uzimas rezultati ostali i imas * jer ne zelis pokazivac hoces vrednost pravu
+	}
+	return *min_element(results.begin(), results.end(), komp); // isto i ovde oces vrednost pravu umesto pokazivac iliti Iterator koji bi se vratio
+}
+
+int main() {
+	srand(time(NULL)); // da imamo uvek random brojeve i ne iste rezultate sa RAND
+	int n = 1 << 20; // 2^20
+	vector<int> bla(n);
+
+	for (int i = 0; i < n; i++)
+	{	// koristimo abs pa ajde da ima neki negativni brojevi inace ne bi morali -20000
+		bla[i] = (rand() % 40000) - 20000;
+
+	}
+
+	auto KOMP = [](int a, int b) {
+		return abs(a) < abs(b);
+	};
+
+	int rezultat = min_elem(bla.begin(), bla.end(), KOMP, 3);
+
+	cout << "Minimalni element po apsolutnoj vrednosti je: " << rezultat << endl; // rezultat ce uvek bude skoro 0 za veci n jer logicno 0 je najmanji broj ako stavis n = 10 ce dobijas razni drugi
+
+	return 0;
+}
+
+
+
+// Napisati thread-safe verziju reda. Omogućiti korišćenje metodama bool try_pop(T&) i void wait_and_pop(T&). Testirati kreiranjem jedne niti koja proizvodi elemente i više niti koje paralelno pokušavaju da pristupe i uzmu sa reda proizvode (recimo cele brojeve).
+#include <iostream>
+#include <thread>
+#include <future>
+#include <chrono>
+#include <vector>
+#include <math.h>
+#include <ctime>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+
+
+using namespace std;
+
+// ovaj zadatak je isti ko od vezbe al cu uradim jednu stvar koju nije na vezbe threadsafe_queue& operator=(const threadsafe_queue&) = delete;
+
+template<typename T>
+class TSQueue {
+private:
+	queue<T> q;
+	mutable mutex m;
+	condition_variable cv;
+public:
+	TSQueue() = default; // ovo mu govori da napravi standardni konstruktor
+
+	TSQueue(const TSQueue& other) {
+		lock_guard<mutex> s(other.m);
+		this->q = other.q;
+	}
+
+	TSQueue& operator=(const TSQueue& other) { // nzm sto ovo na vezbe nije uradio bukvalno skoro isto ko konstruktor kopije samo mora zakljucas prvo
+		if (this != &other) {
+			lock(this->m, other.m);
+			unique_lock<mutex> s1(this->m, adopt_lock);
+			unique_lock<mutex> s2(other.m, adopt_lock);
+
+			this->q = other.q;
+		}
+		return *this;
+	}
+
+	bool empty() const {
+		lock_guard<mutex> s(m);
+		return q.empty();
+	}
+
+	void push(T vr) {
+		lock_guard<mutex> s(this->m);
+		q.push(vr);
+		cv.notify_one();
+	}
+
+	bool try_pop(T& value) { // prvo zakljucas pa onda proveris jer sta ako proveris i odma nakon toga pristupi na red i uzme vrednost dobijas error
+		lock_guard<mutex> s(this->m);
+		if (this->empty()) return false;
+		value = q.front();
+		q.pop();
+
+		return true;
+	}
+
+	shared_ptr<T> try_pop() { // isk ne znam dal mora pisemo 2 verzije ali ova verzija je navodno brza jer sta ako iamo milion x milion matricu u stack i ti mora kopiras posto ce se to desi
+		lock_guard<mutex> s(this->m);
+		if (this->empty()) return shared_ptr<T>();
+		shared_ptr<T> value = make_shared<T>(this->q.front());
+		this->q.pop();
+		return value;
+	}
+
+	void wait_and_pop(T& value) {
+		unique_lock<mutex> s(this->m);
+		cv.wait(s, [this]() { return !q.empty(); }); // conditional variable je zasluzna za ovo umesto da zauvek imamo while pa da se gasi kad dobijemo vrednost u queue ovo ce kaze na thread da spava dok se ne pojavi vrednost
+		value = move(q.front());
+		this->q.pop();
+
+	}
+
+	shared_ptr<T> wait_and_pop() {
+		unique_lock<mutex> s(this->m);
+		cv.wait(s, [this]() { return !q.empty(); });
+		shared_ptr<T> value = make_shared<T>(move(q.front()));
+		q.pop();
+		return value;
+	}
+
+};
+
+TSQueue<int> tsq;
+
+void producer() {
+	while (true) {
+		this_thread::sleep_for(chrono::milliseconds(1000));
+		tsq.push(rand() % 100);
+	}
+}
+
+void consumer() {
+	while (true) {
+		this_thread::sleep_for(chrono::milliseconds(400));
+		cout << *(tsq.wait_and_pop()) << "\n";
+	}
+}
+
+int main() {
+
+	thread t1(&producer);
+	thread t2(consumer);
+	thread t3(consumer);
+	t1.join();
+	t2.join();
+	t3.join();
+
+	return 0;
+}
+
+
+
+// Napisati program koji rešava sistem od n linearnih jednačina sa n nepoznatih. Implementirati koristeći Gausovu eliminaciju. Podrazumevati da jednačina ima tačno n rešenja. Paralelizovati izvršenje gde god je to moguće koristeći omp direktive.
+
+#include <iostream>
+#include <omp.h>
+#include <chrono>
+
+using namespace std;
+
+template<typename T>
+void transform_row(T** mat, T* b, int n, int row_i, int row_j, T factor) {
+  for (int j = row_i; j < n; j++) {
+    mat[row_j][j] += mat[row_i][j] * factor;
+  }
+  b[row_j] += b[row_i] * factor;
+}
+
+template<typename T>
+T* gaus_el(T** mat, T* b, int n) {
+  T* x = new T[n];
+  int pivot_i = 0;
+  #pragma omp parallel shared(pivot_i)
+  {
+    while (pivot_i < n) {
+      #pragma omp single 
+      {
+        T pivot = mat[pivot_i][pivot_i];
+
+        for (int i = pivot_i + 1; i < n; i++) {
+          T factor = -1 * mat[i][pivot_i] / pivot;
+          #pragma omp task if(n - pivot_i > 256)
+          transform_row(mat, b, n, pivot_i, i, factor);
+        }
+      }
+      #pragma omp single
+      pivot_i++;
+    }
+  }
+  
+  for (int i = n - 1; i >= 0; i--) {
+    x[i] = b[i] / mat[i][i];
+    #pragma omp parallel for
+    for (int row_above = i - 1; row_above >= 0; row_above--) {
+      b[row_above] -= x[i] * mat[row_above][i];
+    }
+  }
+  return x;
+}
+
+int main(){
+  int n = 1 << 10;
+
+  double** matrica = new double*[n];
+  
+  for (int i = 0; i < n; i++) {
+    matrica[i] = new double[n];
+    for (int j = 0; j < n; j++) {
+      matrica[i][j] = rand() % 10;
+    }
+  }
+ 
+  double* b = new double[n];
+  for (int i = 0; i < n; i++) {
+    b[i] = rand() % 10;
+  }
+  auto t_start = chrono::high_resolution_clock::now();
+  double* x = gaus_el(matrica, b, n);
+  auto t_end = chrono::high_resolution_clock::now();
+
+  auto duration = chrono::duration_cast<chrono::microseconds>(t_end - t_start).count();
+  cout << duration;
+  cout << endl;
+  return 0;
+}
+
+
+
+// Jedan od načina da se dobije broj pi je kao određeni intergral \int^{1}_{0} 4/(1+x^2) dx. Aproksimirati dati integral konačnom sumom - sabiranje obaviti korišćenjem omp direktiva i većeg broja niti.
+// Implementirati tri verzije rešenja, po izboru, uporediti performanse i u komentaru napisati rangiranje metoda. Interval (0,1) podeliti na n=2^25 dela.
+// Potrebne biblioteke: mutex, chrono, condition_variable, queue, algorithm, future, vector, functional, thread
+
+#include <iostream>
+#include <thread>
+#include <future>
+#include <chrono>
+#include <vector>
+#include <math.h>
+#include <ctime>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <omp.h>
+
+using namespace std;
+// najbrza verzija je verzija 1 pa onda ide verzija 3 pa na kraju verzija 2 :DDD
+void verzija1(int n, int thread_number = 4) {
+	double dx = (1.0 - 0.0) / n;
+	double suma = 0;
+#pragma omp parallel for reduction(+:suma) num_threads(thread_number)
+	for (int i = 0; i < n; i++)
+	{
+		double x = (0.5 + i) * dx;
+		suma += 4.0 / (1.0 + (x * x));
+	}
+	double kurac = suma * dx;
+	cout << kurac << endl;
+}
+
+void verzija2(int n, int thread_number = 4) {
+	double dx = (1.0 - 0.0) / n;
+
+	double suma = 0.0;
+
+#pragma omp parallel num_threads(thread_number)
+	{
+		int tid = omp_get_thread_num();
+		double local = 0.0;
+		for (int i = tid; i < n; i += thread_number) {
+			double x = (0.5 + i) * dx;
+			double y = 4.0 / (1.0 + (x * x));
+			local += y;
+		}
+#pragma omp critical
+		suma += local;
+	}
+	suma *= dx;
+	cout << suma << endl;
+}
+
+void verzija3(int n, int thread_number = 4) {
+	double dx = 1.0 / n;
+	double suma = 0.0;
+#pragma omp parallel num_threads(thread_number)
+	{
+		double local = 0.0;
+#pragma omp for
+		for (int i = 0; i < n; i++)
+		{
+			double x = (0.5 + i) * dx;
+			double y = 4.0 / (1.0 + (x * x));
+			local += y;
+		}
+#pragma omp critical
+		suma += local;
+	}
+	cout << suma * dx << endl;
+}
+
+
+int main() {
+	int n = 1 << 25;
+	int niti = 4;
+
+	auto v1 = chrono::high_resolution_clock::now();
+	verzija1(n, niti);
+	auto v2 = chrono::high_resolution_clock::now();
+	cout << chrono::duration_cast<chrono::milliseconds>(v2 - v1).count() << endl;
+
+	auto v3 = chrono::high_resolution_clock::now();
+	verzija2(n, niti);
+	auto v4 = chrono::high_resolution_clock::now();
+	cout << chrono::duration_cast<chrono::milliseconds>(v4 - v3).count() << endl;
+
+	auto v6 = chrono::high_resolution_clock::now();
+	verzija3(n, niti);
+	auto v7 = chrono::high_resolution_clock::now();
+	cout << chrono::duration_cast<chrono::milliseconds>(v7 - v6).count() << endl;
+
+	return 0;
+
+}
+
+
+
+// Dati su vektori a,b,c,d,e,f pripada R^n. Potrebno je izračunati sledeće izraze:
+// s = a ^ T * b + c ^ T * d,
+// p = Tr(b * a ^ T) * c + e + f,
+// q = s * a ^ T * (e + f) + p * c ^ T * d.
+// Napisati potrebne pomoćne funkcije i izvršiti ih pomoću std::async u zasebnim nitima na način da izvršenje bude korektno i što optimalnije.Podsetnik: Tr(A) predstavlja trag matrice, tj.sumu elemenata na glavnoj dijagonali. (C++)
+
+#include <iostream>
+#include <vector>
+#include <future>
+using namespace std;
+
+double skalar(const vector<double>& v1, const vector<double>& v2) {
+	double suma = 0;
+	for (int i = 0; i < v1.size(); i++)
+	{
+		suma += v1[i] * v2[i];
+	}
+	return suma;
+}
+
+vector<double> formula_p(const double skalar, const vector<double>& c, const vector<double>& e, const vector<double>& f) {
+	vector<double> p(c.size());
+	for (int i = 0; i < c.size(); i++)
+	{
+		p[i] = (skalar * c[i]) + e[i] + f[i];
+	}
+
+	return p;
+}
+
+vector<double> formula_q(double s_val, double s1, const vector<double>& p, double s2) {
+	vector<double> q(p.size());
+	for (int i = 0; i < p.size(); i++) {
+		q[i] = (s_val * s1) + (p[i] * s2);
+	}
+	return q;
+}
+
+int main() {
+	int n = 10;
+	vector<double>a(n, 1.0); vector<double> b(n, 2.0); vector<double>c(n, 3.0); vector<double>d(n, 4.0); vector<double>e(n, 5.0); vector<double>f(n, 6.0);
+
+	// racunamo s
+	future<double> sk1 = async(launch::async, skalar, ref(a), ref(b));
+	future<double> sk2 = async(launch::async, skalar, ref(c), ref(d));
+	double s = sk1.get() + sk2.get();
+
+
+	//racunamo p
+	// Tr(b*a^t) je bukvalno samo skalar od a i b ovo je samo da te izjebe debil sa bradicu jarecu grr
+	future<double> sk3 = async(launch::async, skalar, ref(a), ref(b));
+	double sk3_ = sk3.get();
+
+	future<vector<double>> res1 = async(launch::async, formula_p, sk3_, ref(c), ref(e), ref(f));
+	vector<double> p = res1.get();
+
+	// racunamo q
+
+	vector<double> ef(n);
+	for (int i = 0; i < n; i++) ef[i] = e[i] + f[i];
+
+	future<double> sk4 = async(launch::async, skalar, ref(a), ref(ef));
+	future<double> sk5 = async(launch::async, skalar, ref(c), ref(d));
+
+	double s_q1 = sk4.get();
+	double s_q2 = sk5.get();
+
+	future<vector<double>> res2 = async(launch::async, formula_q, s, s_q1, ref(p), s_q2);
+	vector<double> q = res2.get();
+
+
+	for (int i = 0; i < n; i++)
+	{
+		cout << "q: " << q[i] << "\n";
+	}
+	for (int i = 0; i < n; i++)
+	{
+		cout << "p: " << p[i] << "\n";
+	}
+	cout << "skalar s: " << s << "\n";
+
+	return 0;
+}
+
+
+// Napisati potrebne klase i OMP direktive tako da sledeća ilnija može da se kompajlira, da se koristi odloženo izračunavanje i da izračunavanje bude podeljeno većem broju niti:
+// Vektor e = koren(kvadrat(a)+koren(b)+c)+kvadrat(a+d);
+// Pri čemu su a,b,c,d vektori, a funkcije kvadriranja i korenovanja se primenjuju pokomponentno.
+
+#include <iostream>
+#include <omp.h>
+#include <vector>
+#include <cmath> // Bolje koristiti cmath za C++
+
+using namespace std;
+
+template<typename T>
+class Vektor {
+private:
+    vector<T> vek;
+public:
+    using value_type = T;
+    Vektor() = default;
+    Vektor(int n) : vek(n) {}
+    Vektor(const Vektor&) = default;
+
+    // Prvi const kaže šta vraća, drugi const garantuje da funkcija ne menja Vektor
+    const T operator[](int i) const { return vek[i]; }
+    T& operator[](int i) { return vek[i]; }
+    int size() const { return vek.size(); }
+
+    // Konstruktor koji prihvata "drvo" operacija i zapravo izvršava proračun
+    template<typename U>
+    Vektor(const U& drugi) {
+        this->vek.resize(drugi.size());
+#pragma omp parallel for num_threads(4)
+        for (int i = 0; i < drugi.size(); i++) {
+            vek[i] = drugi[i];
+        }
+    }
+
+    template<typename U>
+    Vektor& operator=(const U& drugi) {
+        if (this->vek.size() != drugi.size()) {
+            this->vek.resize(drugi.size());
+        }
+#pragma omp parallel for num_threads(4)
+        for (int i = 0; i < drugi.size(); i++) {
+            vek[i] = drugi[i];
+        }
+        return *this;
+    }
+};
+
+// --- Operacije ---
+
+struct Plus {
+    template<typename T>
+    T operator() (const T& a, const T& b) const { return a + b; }
+};
+
+struct koren {
+    template<typename T>
+    T operator() (const T& a) const { return sqrt(a); }
+};
+
+struct kvadratop {
+    template<typename T>
+    T operator()(const T& a) const { return a * a; }
+};
+
+// --- Expression Templates omotači ---
+
+template<typename BinOP, typename L, typename R>
+class BinarnaOperacija {
+private:
+    BinOP binop;
+    L levi;
+    R desni;
+public:
+    using value_type = typename L::value_type;
+    BinarnaOperacija(BinOP binop, L levi, R desni) : binop(binop), levi(levi), desni(desni) {}
+
+    // OVDE JE BIO PROBLEM: dodati 'const'
+    value_type operator[] (int i) const { return binop(levi[i], desni[i]); }
+    int size() const { return levi.size(); }
+};
+
+template<typename F, typename Arg>
+class UnarnaOperacija {
+private:
+    F f;
+    Arg arg;
+public:
+    using value_type = typename Arg::value_type;
+    UnarnaOperacija(F f, Arg arg) : f(f), arg(arg) {}
+
+    // I OVDE: dodati 'const'
+    int size() const { return arg.size(); }
+    value_type operator[] (int i) const { return f(arg[i]); }
+};
+
+// --- Helper funkcije za lakše pisanje izraza ---
+
+template<typename L, typename R>
+auto operator+(const L& levi, const R& desni) {
+    return BinarnaOperacija<Plus, L, R>(Plus(), levi, desni);
+}
+
+template<typename T>
+auto sqrt_(const T& a) {
+    return UnarnaOperacija<koren, T>(koren(), a);
+}
+
+template<typename Arg>
+auto kvadrat(const Arg& a) {
+    return UnarnaOperacija<kvadratop, Arg>(kvadratop(), a);
+}
+
+// --- Main ---
+
+int main() {
+    int n = 10;
+    Vektor<double> a(n), b(n), c(n), d(n);
+
+    for (int i = 0; i < n; i++) {
+        a[i] = i + 1.0;
+        b[i] = (i + 1.0) * 2.0;
+        c[i] = 3.0;
+        d[i] = 0.5;
+    }
+
+    cout << "Izracunavam..." << endl;
+
+    // Sada se sve izvršava u JEDNOM prolazu kroz petlju (unutar operatora =)
+    Vektor<double> e = sqrt_(kvadrat(a) + sqrt_(b) + c) + kvadrat(a + d);
+
+    for (int i = 0; i < n; i++) {
+        cout << "e[" << i << "] = " << e[i] << endl;
+    }
+
+    return 0;
+}
+
+
+
+// Naredni problem treba rešiti koristeći MPI i veći broj procesa.
+// Dat je niz od n elemenata. Broj n ne mora biti deljiv brojem procesa. Potrebno je normalizovati dati niz, tj. podeliti svaki element maksimumom niza.
+// Prvo je potrebno izračunati maksimum datog niza tako što svaki proces dobije "parče" niza koje izračuna maksimum, a zatim jedan proces treba da objedini te rezultate lokalne koristeći MPI_Reduce(). Zatim je potrebno dobijeni maksimum objaviti svim procesima (engl.broadcast). Svi procesi zatim normalizuju deo niza koji im je ranije dodeljen, a nakon toga šalju svoj deo jednom procesu koji objedinjuje sve podatke u konačan normalizovani niz.
+
+// Pokretanje MPI programa iz cmd - a: mpiexec -np <N> <path>
+
+#include <algorithm>
+#include <climits>
+#include <iostream>
+#include <mpi.h>
+#include <vector>
+
+int main(int argc, char** argv) {
+    MPI_Init(&argc, &argv);
+
+    int curr_rank;
+    int p_size;
+
+    MPI_Comm_rank(MPI_COMM_WORLD, &curr_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &p_size);
+
+    int n = 10;
+
+    std::vector<int> counts(p_size, n / p_size);
+    std::vector<int> displacements(p_size);
+
+    displacements[0] = 0;
+
+    for (int i = 0; i < n % p_size; i++) {
+        counts[i]++;
+    }
+    for (int i = 1; i < p_size; i++) {
+        displacements[i] = displacements[i - 1] + counts[i - 1];
+    }
+
+    std::vector<double> vec(counts[curr_rank]);
+
+    std::vector<double> input;
+    if (curr_rank == 0) {
+        input.resize(n);
+        for (int i = 1; i <= n; i++) {
+            input[i - 1] = i;
+            std::cout << i << " ";
+        }
+        std::cout << std::endl;
+
+    }
+    MPI_Scatterv(input.data(), counts.data(), displacements.data(),
+    MPI_DOUBLE, vec.data(), counts[curr_rank], MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+    double local_max = *std::max_element(vec.begin(), vec.end());
+
+    double global_max = INT_MIN;
+
+    MPI_Reduce(&local_max, &global_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
+    MPI_Bcast(&global_max, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+    for (int i = 0; i < counts[curr_rank]; i++) {
+        vec[i] = vec[i] / global_max;
+    }
+
+    std::vector<double> normal_vec(n);
+    MPI_Gatherv(vec.data(), counts[curr_rank], MPI_DOUBLE,
+        normal_vec.data(), counts.data(), displacements.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+    if (curr_rank == 0) {
+        for (auto el : normal_vec) {
+            std::cout << el << " ";
+        }
+        std::cout << std::endl;
+    }
+
+    MPI_Finalize();
+
+    return 0;
+}
+
+
+
+// Merge-Sort THREAD EDITION
+
+#include <iostream>
+#include <thread>
+#include <chrono>
+#include <vector>
+
+using namespace std;
+unsigned short MAX_DEPTH = 1; // zapravo optimalno je da bude 0 ili 1
+
+template<typename T>
+void merge(T* niz, int l, int r) {
+    int mid = (r + l) / 2;
+    int n1 = mid - l + 1;
+    int n2 = r - mid;
+
+    T* A = new T[n1];
+    T* B = new T[n2];
+
+    for (int i = 0; i < n1; i++) A[i] = niz[i + l];
+    for (int i = 0; i < n2; i++) B[i] = niz[mid + 1 + i];
+
+    int i = l, ai = 0, bi = 0;
+    while (ai < n1 && bi < n2) {
+        if (A[ai] <= B[bi]) {
+            niz[i++] = A[ai++];
+        }
+        else {
+            niz[i++] = B[bi++];
+        }
+    }
+
+    while (ai < n1) niz[i++] = A[ai++];
+    while (bi < n2) niz[i++] = B[bi++];
+
+    delete[] A;
+    delete[] B;
+}
+
+template<typename T>
+void mergesort(T* niz, int l, int r, int depth) {
+    if (l >= r) return;
+    int mid = (l + r) / 2;
+
+    if (depth < MAX_DEPTH) {
+        thread t1(&mergesort<T>, niz, l, mid, depth + 1);
+        mergesort(niz, mid + 1, r, depth + 1);
+        t1.join();
+    }
+    else {
+        mergesort(niz, l, mid, depth + 1);
+        mergesort(niz, mid + 1, r, depth + 1);
+    }
+    merge(niz, l, r);
+}
+
+
+int main() {
+    int n = 1 << 20;
+    int* v1 = new int[n];
+    for (int i = 0; i < n; i++)
+        v1[i] = rand() % 100000;
+
+    auto s = chrono::high_resolution_clock::now();
+    mergesort(v1, 0, n - 1, 0);
+    auto f = chrono::high_resolution_clock::now();
+    cout << chrono::duration_cast<chrono::milliseconds>(f - s).count() << endl;
+
+    return 0;
+}
+
+
+
+// Naredni problem treba rešiti koristeći MPI i tri procesa.
+// Proces 0 može da direktno pristupi vektoru/nizu a i matrici M (da ih inicijalizuje) i proces 0 može da izvrši funkciju g(M, x)=M*x (matrica M ne sme se slati drugim procesima). Pretpostaviti da a pripada R^n, M pripada R^(n x n).
+// Proces 1 može da direktno pristupi nizu b (da ga inicijaizuje) i proces 1 može da izvrši funkciju f (na primer, kvadriranje svakog elementa).
+// Proces 2 treba da izračuna sumu: sum(f(g(M, a)))+sum(f(b))+sum(g(M, f(b))). Izračunati potrebnu sumu i rezultat saopštiti (engl. broadcast) svim procesima. Pretpostaviti da su svi nizovi dužine n.
+
+#include <iostream>
+#include "mpi.h"
+#include <vector>
+#include <math.h>
+#include <ctime>
+using namespace std;
+const int n = 100;
+
+void g(double* m, double* x, double* rezultat) {
+
+	for (int i = 0; i < n; i++) {
+		rezultat[i] = 0;
+		for (int j = 0; j < n; j++)
+		{
+			rezultat[i] += m[i * n + j] * x[j];
+		}
+	}
+}
+
+void f(double* b) {
+	for (int i = 0; i < n; i++)
+	{
+		b[i] *= b[i];
+	}
+}
+
+template<typename T>
+T sum(T* p) {
+	T suma = 0;
+	for (int i = 0; i < n; i++)
+	{
+		suma += p[i];
+	}
+	return suma;
+}
+
+enum tag { Ma0to1, fb1to0, fb1to2, Ma1to2, gMfb0to2 };
+
+
+
+int main(int argc, char** argv) {
+	srand(time(0));
+	int rank;
+	MPI_Init(&argc, &argv);
+	MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+	double suma = 0;
+	if (rank == 0) {
+
+		double* M = new double[n * n];
+		double* a = new double[n];
+		double* Ma = new double[n];
+		double* fb = new double[n];
+		double* kopija = new double[n * n];
+		MPI_Request r1, r2, r3, r4;
+		MPI_Status s;
+		for (int i = 0; i < n; i++)
+		{
+			a[i] = (i * i) / ((rand() % 3) + 1);
+			for (int j = 0; j < n; j++)
+			{
+				M[i * n + j] = rand() % 10 * i + j;
+			}
+		}
+		memcpy(kopija, M, sizeof(double) * n * n);
+		g(M, a, Ma);
+		MPI_Isend(Ma, n, MPI_DOUBLE, 1, Ma0to1, MPI_COMM_WORLD, &r1);
+
+		MPI_Irecv(fb, n, MPI_DOUBLE, 1, fb1to0, MPI_COMM_WORLD, &r2);
+		MPI_Wait(&r1, &s);
+		MPI_Wait(&r2, &s);
+		g(kopija, fb, Ma);
+		MPI_Isend(Ma, n, MPI_DOUBLE, 2, gMfb0to2, MPI_COMM_WORLD, &r4);
+		MPI_Wait(&r4, &s);
+		delete[] M;
+		delete[] Ma;
+		delete[] a;
+		delete[] fb;
+		delete[] kopija;
+	}
+	else if (rank == 1) {
+		double* b = new double[n];
+		double* Ma = new double[n];
+		MPI_Request r1, r2, r3, r4;
+		MPI_Status s;
+		for (int i = 0; i < n; i++)
+		{
+			b[i] = i * 3 / 2;
+		}
+
+		f(b);
+		MPI_Irecv(Ma, n, MPI_DOUBLE, 0, Ma0to1, MPI_COMM_WORLD, &r1);
+		MPI_Isend(b, n, MPI_DOUBLE, 0, fb1to0, MPI_COMM_WORLD, &r2);
+		MPI_Isend(b, n, MPI_DOUBLE, 2, fb1to2, MPI_COMM_WORLD, &r3);
+		MPI_Wait(&r1, &s);
+		f(Ma);
+		MPI_Isend(Ma, n, MPI_DOUBLE, 2, Ma1to2, MPI_COMM_WORLD, &r4);
+		MPI_Wait(&r2, &s);
+		MPI_Wait(&r3, &s);
+		MPI_Wait(&r4, &s);
+
+		delete[] b;
+		delete[] Ma;
+	}
+	else if (rank == 2) {
+		double* fgma = new double[n];
+		double* fb = new double[n];
+		double* gmfb = new double[n];
+		MPI_Status s1, s2, s3;
+		MPI_Recv(fgma, n, MPI_DOUBLE, 1, Ma1to2, MPI_COMM_WORLD, &s1);
+		MPI_Recv(fb, n, MPI_DOUBLE, 1, fb1to2, MPI_COMM_WORLD, &s2);
+		MPI_Recv(gmfb, n, MPI_DOUBLE, 0, gMfb0to2, MPI_COMM_WORLD, &s3);
+
+		suma += sum(fgma) + sum(fb) + sum(gmfb);
+		delete[] fgma;
+		delete[] fb;
+		delete[] gmfb;
+	}
+	MPI_Bcast(&suma, 1, MPI_DOUBLE, 2, MPI_COMM_WORLD);
+
+	// DODAJ OVE LINIJE OVDE: ovo je chatgpt dodao ne bogdan
+	if (rank == 0) {
+		cout << "========================================" << endl;
+		cout << "Program uspesno zavrsen!" << endl;
+		cout << "Konacna suma dobijena sa ranga 2 je: " << suma << endl;
+		cout << "========================================" << endl;
+	}
+
+	MPI_Finalize();
+
+	return 0;
+}
+
+
+
+// Naredni problem treba rešiti koristeći MPI i četri procesa.
+// Proces 0 inicijalno ima pristup kvadratnoj matrici A (može da je inicijalizuje/učita).
+// Proces 1 inicijalno ima pristup kvadratnoj matrici B (može da je inicijalizuje/učita).
+// Proces 2 može da množi matrice.
+// Proces 3 treba da prikaže rezultat |A| * |B| * A * B.
+// Svi procesi mogu da računaju determinantu matrice. Organizovati P2P MPI pozive između procesa 0-3 tako da se što optimalnije izračuna rezultat |A| * |B| * A * B.
+
+#include <iostream>
+#include <mpi.h>
+#include <vector>
+
+using namespace std;
+
+template<typename T>
+void transform_row(vector<T>& mat, int n, int row_i, int row_j, T factor) {
+    for (int i = row_i; i < n; i++) {
+        mat[row_j * n + i] += mat[row_i * n + i] * factor;
+    }
+}
+
+template<typename T>
+double det(vector<T> mat, int n) {
+    double det = 1.0;
+    int pivot_i = 0;
+
+    while (pivot_i < n) {
+        int pivot_j = pivot_i;
+        T pivot = mat[pivot_i * n + pivot_j];
+        for (int i = pivot_i + 1; i < n; i++) {
+            T factor = -1 * mat[i * n + pivot_i] / pivot;
+            transform_row(mat, n, pivot_i, i, factor);
+        }
+        pivot_i++;
+    }
+    for (int i = 0; i < n; ++i) {
+        det *= mat[i * n + i];
+    }
+
+    return det;
+
+}
+
+enum {
+    detAto3,
+    detBto3,
+    Ato2,
+    Bto2,
+    ABto3
+};
+
+int main(int argc, char** argv) {
+    MPI_Init(&argc, &argv);
+
+    int curr_rank;
+    int p_size;
+
+    MPI_Comm_size(MPI_COMM_WORLD, &p_size);
+    MPI_Comm_rank(MPI_COMM_WORLD, &curr_rank);
+
+    int n = 2;
+    vector<double> A(n * n, 0.0);
+    vector<double> B(n * n, 0.0);
+    vector<double> C(n * n, 0.0);
+
+    if (curr_rank == 0) {
+        for (int i = 0; i < n * n; i++) {
+            A[i] = i + 1;
+        }
+        MPI_Send(A.data(), n * n, MPI_DOUBLE, 2, Ato2, MPI_COMM_WORLD);
+        double detA = det(A, n);
+        MPI_Send(&detA, 1, MPI_DOUBLE, 3, detAto3, MPI_COMM_WORLD);
+    }
+
+    if (curr_rank == 1) {
+        for (int i = 0; i < n * n; i++) {
+            B[i] = i + 1;
+        }
+        MPI_Send(B.data(), n * n, MPI_DOUBLE, 2, Bto2, MPI_COMM_WORLD);
+        double detB = det(B, n);
+        MPI_Send(&detB, 1, MPI_DOUBLE, 3, detBto3, MPI_COMM_WORLD);
+    }
+
+    if (curr_rank == 2) {
+        MPI_Recv(A.data(), n * n, MPI_DOUBLE, 0, Ato2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        MPI_Recv(B.data(), n * n, MPI_DOUBLE, 1, Bto2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j < n; j++) {
+                for (int k = 0; k < n; k++) {
+                    C[i * n + j] += A[i * n + k] * B[k * n + j];
+                }
+            }
+        }
+        MPI_Send(C.data(), n * n, MPI_DOUBLE, 3, ABto3, MPI_COMM_WORLD);
+    }
+
+    if (curr_rank == 3) {
+        MPI_Recv(C.data(), n * n, MPI_DOUBLE, 2, ABto3, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        double detA;
+        double detB;
+        MPI_Recv(&detA, 1, MPI_DOUBLE, 0, detAto3, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        MPI_Recv(&detB, 1, MPI_DOUBLE, 1, detBto3, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+        for (int i = 0; i < n; ++i) {
+            for (int j = 0; j < n; ++j) {
+                std::cout << detA * detB * C[i * n + j] << " ";
+            }
+            std::cout << std::endl;
+        }
+    }
+
+    MPI_Finalize();
+    return 0;
+}
+
+
+
+// Data je matrica A formata n x m. Potrebno je standardizovati vrednosti u svakom redu i dobiti matricu A definisanu kao:
+
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <omp.h>
+
+using namespace std;
+
+void standardizuj_matricu(double* A, int n, int m) {
+    // Paralelizujemo spoljasnju petlju - svaki red je nezavisan zadatak
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < n; i++) {
+        
+        // 1. KORAK: Izracunaj prosek reda (mu)
+        double suma = 0;
+        for (int j = 0; j < m; j++) {
+            suma += A[i * m + j];
+        }
+        double mu = suma / m;
+
+        // 2. KORAK: Izracunaj varijansu/standardnu devijaciju (sigma)
+        double suma_kvadrata = 0;
+        for (int j = 0; j < m; j++) {
+            double razlika = A[i * m + j] - mu;
+            suma_kvadrata += razlika * razlika;
+        }
+        // Formula sa slike kaze podeljeno sa m-1
+        double sigma = sqrt(suma_kvadrata / (m - 1));
+
+        // 3. KORAK: Transformisi elemente (standardizacija)
+        // Ako je sigma 0 (svi brojevi u redu isti), preskacemo deljenje da ne pukne program
+        if (sigma > 0) {
+            for (int j = 0; j < m; j++) {
+                A[i * m + j] = (A[i * m + j] - mu) / sigma;
+            }
+        }
+    }
+}
+
+
+
+// Klasa Vektor sa operatorima
+
+#include <iostream>
+
+template<typename  T>
+class Vector {
+private:
+    T* data;
+    int n;
+public:
+    Vector(int n) : data(new T[n]), n(n) {}
+
+    Vector(Vector const& v) : n(v.n) {
+        data = new T[n];
+        for (int i = 0; i < n; i++) {
+            data[i] = v.data[i];
+        }
+    }
+
+    Vector(Vector&& v) noexcept : data(v.data), n(v.n) {
+        v.data = nullptr;
+        v.n = 0;
+    }
+
+    Vector& operator= (Vector const& v) {
+        if (this != &v) {
+            T* newData = new T[v.n];
+            n = v.n;
+            for (int i = 0; i < n; i++) {
+                newData[i] = v.data[i];
+            }
+            delete[] data;
+            data = newData;
+        }
+        return *this;
+    }
+
+    Vector& operator= (Vector&& v) noexcept {
+        if (this != &v) {
+            delete[] data;
+            n = v.n;
+            data = v.data;
+            v.data = nullptr;
+            v.n = 0;
+        }
+        return *this;
+    }
+
+    T& operator[] (int i) {
+        return data[i];
+    }
+
+    const T& operator[] (int i) const {
+        return data[i];
+    }
+
+    Vector operator+ (Vector const& v) {
+        if (n != v.n) { throw std::runtime_error("Vector size mismatch"); }
+        Vector result(n);
+        for (int i = 0; i < n; i++) {
+            result.data[i] = data[i] + v.data[i];
+        }
+        return result;
+    }
+
+    T* begin() {
+        return data;
+    }
+
+    T* end() {
+        return data + n;
+    }
+
+    int size() const {
+        return n;
+    }
+
+    const T* begin() const { return data; }
+    const T* end() const { return data + n; }
+
+    ~Vector() {
+        delete[] data;
+    }
+};
+
+int main() {
+    Vector<int> v(10);
+    for (int i = 0; i < v.size(); i++) {
+        v[i] = i;
+    }
+    for (int i : v) {
+        std::cout << i << std::endl;
+    }
+
+
+    return 0;
+}
+
+
+
+// Merge-Sort OMP EDITION
+
+#include <iostream>
+#include <thread>
+#include<omp.h>
+using namespace std;
+template <typename T>
+void merge(T* niz, int l, int r) {
+    int mid = (l + r) / 2;
+    int n1 = mid - l + 1;
+    int n2 = r - mid;
+
+    T* A = new T[n1];
+    T* B = new T[n2];
+    for (int i = 0; i < n1; i++)
+        A[i] = niz[i + l];
+
+    for (int i = 0; i < n2; i++)
+        B[i] = niz[mid + i + 1];
+
+    int i = l;
+    int ai = 0;
+    int bi = 0;
+    while (ai < n1 && bi < n2) {
+        if (A[ai] >= B[bi]) {
+            niz[i++] = B[bi++];
+        }
+        else {
+            niz[i++] = A[ai++];
+        }
+    }
+
+    while (ai < n1) niz[i++] = A[ai++];
+    while (bi < n2) niz[i++] = B[bi++];
+
+    delete[] A;
+    delete[] B;
+}
+
+int max_depth = 3; //stavio sam 3 zbog moj procesor
+template <typename T>
+void mergesort(T* niz, int l, int r, int depth = 0) {
+    if (l >= r) return;
+    int mid = (l + r) / 2;
+
+    if (max_depth > depth) {
+#pragma omp parallel sections
+        {
+#pragma omp section
+            mergesort(niz, l, mid, depth + 1);
+#pragma omp section
+            mergesort(niz, mid + 1, r, depth + 1);
+        }
+
+    }
+    else {
+        mergesort(niz, l, mid, depth + 1);
+        mergesort(niz, mid + 1, r, depth + 1);
+    }
+
+
+    merge(niz, l, r);
+}
+
+int main() {
+    int n = 1 << 20; // 1,048,576 elemenata
+    int* v1 = new int[n];
+
+    for (int i = 0; i < n; i++)
+        v1[i] = rand() % 100000;
+
+    auto s = chrono::high_resolution_clock::now();
+
+    mergesort(v1, 0, n - 1, 0);
+
+    auto f = chrono::high_resolution_clock::now();
+
+    cout << "Vreme: " << chrono::duration_cast<chrono::milliseconds>(f - s).count() << "ms" << endl;
+
+    delete[] v1;
+    return 0;
+}
