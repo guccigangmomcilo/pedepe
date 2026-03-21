@@ -401,7 +401,6 @@ int main() {
 
 
 	//racunamo p
-	// Tr(b*a^t) je bukvalno samo skalar od a i b ovo je samo da te izjebe debil sa bradicu jarecu grr
 	future<double> sk3 = async(launch::async, skalar, ref(a), ref(b));
 	double sk3_ = sk3.get();
 
