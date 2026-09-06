@@ -1,0 +1,356 @@
+/* Uradi sledeći CPP zadatak iz predmeta Paralelno i Distribuirano programiranje
+
+Dat je sledeći deo implementacije šablona matrice:
+template<typename T>
+class matrix {
+private:
+	long long _rows;
+	long long _cols;
+	T* _data;
+public:
+	matrix(long long rows, long long cols)
+		: _rows(rows), _cols(cols), _data(new T[rows * cols]()) {}
+	~matrix() { delete[] _data; }
+	T* operator[](long long i)	{ return _data + i * _cols; }
+	const T* operator[](long long i) const { return _data + i * _cols; }
+};
+A) Paralelizujte pokomponentni proizvod dve matrice manuelnim deljenjem matrica na "delove" i kreiranjem zadatka (task) za svaki deo.
+B) Paralelizujte pokomponentni prizovod dve matrice koristeći taskloop sa klauzulom grainsize.
+*/
+
+#include <omp.h>
+#include <iostream>
+
+template<typename T>
+class matrix {
+private:
+	long long _rows;
+	long long _cols;
+	T* _data;
+public:
+	matrix(long long rows, long long cols)
+		: _rows(rows), _cols(cols), _data(new T[rows * cols]()) {}
+	~matrix() { delete[] _data; }
+	T* operator[](long long i)	{ return _data + i * _cols; }
+	const T* operator[](long long i) const { return _data + i * _cols; }
+
+	// A) Paralelizacija manuelnim deljenjem na "delove" i kreiranjem zadataka (task)
+	void multiply_manual_tasks(const matrix<T>& other, matrix<T>& result, int num_tasks) const {
+		long long total_elements = _rows * _cols;
+		long long chunk_size = total_elements / num_tasks;
+
+		// Izdvajamo pokazivače kako bismo izbegli probleme sa deljenjem 'this' pokazivača unutar taskova
+		const T* ptrA = this->_data;
+		const T* ptrB = other._data;
+		T* ptrRes = result._data;
+
+		#pragma omp parallel
+		{
+			// Samo jedna nit generiše taskove kako ne bismo dobili duplirane poslove
+			#pragma omp single
+			{
+				for (int i = 0; i < num_tasks; ++i) {
+					long long start = i * chunk_size;
+					// Poslednji task preuzima i potencijalni ostatak elemenata
+					long long end = (i == num_tasks - 1) ? total_elements : start + chunk_size;
+
+					// Kreiramo OpenMP task za svaki deo
+					#pragma omp task firstprivate(start, end) shared(ptrA, ptrB, ptrRes)
+					{
+						for (long long k = start; k < end; ++k) {
+							ptrRes[k] = ptrA[k] * ptrB[k];
+						}
+					}
+				}
+			} // Implicitan taskwait na kraju single regiona
+		}
+	}
+
+	// B) Paralelizacija koristeći taskloop sa klauzulom grainsize
+	void multiply_taskloop(const matrix<T>& other, matrix<T>& result, long long grain_size) const {
+		long long total_elements = _rows * _cols;
+
+		const T* ptrA = this->_data;
+		const T* ptrB = other._data;
+		T* ptrRes = result._data;
+
+		#pragma omp parallel
+		{
+			#pragma omp single
+			{
+				// taskloop automatski deli petlju na taskove veličine 'grain_size'
+				#pragma omp taskloop grainsize(grain_size) shared(ptrA, ptrB, ptrRes)
+				for (long long k = 0; k < total_elements; ++k) {
+					ptrRes[k] = ptrA[k] * ptrB[k];
+				}
+			}
+		}
+	}
+};
+
+
+
+/*
+Za sledeći šablon klase:
+template<typename T, typename U>
+class BankAccount {
+	T balance;	// stanje na racunu
+	U monthly_transactions;	// broj mesecnih transakcija
+public:
+	BankAccount(T bal, U trans);
+
+	T risk_score() const;	// IMPLEMENTIRATI
+	bool operator<(const BankAccount& other) const; // PREKLOPITI
+};
+Implementirati funkciju objekta, risk_score() koja procenjuje rizik računa, tako da vrati abs(balance) * 0.3 + monthly_transactions * 0.7.
+Generisati vektor std::vector<BankAccount<double, unsigned>> sa slučajnim vrednostima stanja i broja transakcija. Paralelizovati pronalaženje računa sa najvećim risk_score(). Napraviti korisničku redukciju za BankAccount<T,U> objekte koja vraća bankovni račun sa najvećim rizikom.
+*/
+
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <random>
+#include <omp.h>
+
+template<typename T, typename U>
+class BankAccount {
+	T balance;	/* stanje na racunu */
+	U monthly_transactions;	/* broj mesecnih transakcija */
+public:
+    // Podrazumevani konstruktor je neophodan za inicijalizaciju 
+    // privatnih kopija pri OpenMP redukciji
+    BankAccount() : balance(0), monthly_transactions(0) {}
+
+	BankAccount(T bal, U trans) : balance(bal), monthly_transactions(trans) {}
+
+	/* IMPLEMENTIRATI: Računanje rizika */
+	T risk_score() const {
+		return std::abs(balance) * 0.3 + monthly_transactions * 0.7;
+	}
+
+	/* PREKLOPITI: Poređenje dva računa na osnovu rizika */
+	bool operator<(const BankAccount& other) const {
+		return this->risk_score() < other.risk_score();
+	}
+
+    // Dodatne metode (getteri) korisne za ispis rezultata
+    T get_balance() const { return balance; }
+    U get_transactions() const { return monthly_transactions; }
+};
+
+// Deklaracija korisničke OpenMP redukcije za konkretan tip BankAccount<double, unsigned>
+// omp_out zadržava onaj objekat koji ima veći risk_score (korišćenjem preklopljenog operatora <)
+#pragma omp declare reduction( \
+    max_risk_reduction : \
+    BankAccount<double, unsigned> : \
+    omp_out = omp_out < omp_in ? omp_in : omp_out \
+) initializer(omp_priv = BankAccount<double, unsigned>())
+
+int main() {
+    const int NUM_ACCOUNTS = 1000000;
+    std::vector<BankAccount<double, unsigned>> accounts;
+    accounts.reserve(NUM_ACCOUNTS);
+
+    // 1. Generisanje vektora sa slučajnim vrednostima
+    std::mt19937 gen(12345); // Fiksno seme za reproducibilnost
+    std::uniform_real_distribution<double> bal_dist(-5000.0, 15000.0);
+    std::uniform_int_distribution<unsigned> trans_dist(0, 150);
+
+    for (int i = 0; i < NUM_ACCOUNTS; ++i) {
+        accounts.emplace_back(bal_dist(gen), trans_dist(gen));
+    }
+
+    // 2. Paralelno pronalaženje računa sa najvećim rizikom pomoću custom redukcije
+    BankAccount<double, unsigned> max_risk_account; // Inicijalno stanje 0, transakcija 0
+
+    // Koristimo OpenMP direktivu sa našom definisanom redukcijom
+    #pragma omp parallel for reduction(max_risk_reduction : max_risk_account)
+    for (int i = 0; i < NUM_ACCOUNTS; ++i) {
+        if (max_risk_account < accounts[i]) {
+            max_risk_account = accounts[i];
+        }
+    }
+
+    // Ispis rezultata
+    std::cout << "Pronadjen racun sa najvecim rizikom:\n";
+    std::cout << "Stanje: " << max_risk_account.get_balance() << "\n";
+    std::cout << "Broj transakcija: " << max_risk_account.get_transactions() << "\n";
+    std::cout << "Risk score: " << max_risk_account.risk_score() << "\n";
+
+    return 0;
+}
+
+
+
+/*
+Šablon niza asset_values sadrži vrednosti različite imovine. Koristeći redukciju po nizu u OpenMP, implementirajte šablon funkcije u C++ koja izračunava ukupnu sumu vrednosti imovine koja spada u jedan od nekoliko opsega vrednosti vrednosti imovine. Šablon funkcije compute_bin_sums ima sledeće parametre:
+    asset_values: šablon niza numeričkih vrednosti imovine;
+    bin_sums: šablon niza koji čuva sume vrednosti imovine za svaki opseg,
+    num_bins: broj opsega za podelu vrednosti imovine,
+    max_value: maksimalnu vrednost imovine koja se koristi za sklairanje opsega, prilikom mapiranja vrednosti imovine iz asset_values na indeks opsega.
+*/
+
+#include <iostream>
+#include <vector>
+#include <omp.h>
+
+template <typename T>
+void compute_bin_sums(const T* asset_values, size_t num_assets, 
+                      T* bin_sums, int num_bins, T max_value) 
+{
+    // 1. Inicijalizacija rezultujućeg niza na nulu
+    for (int i = 0; i < num_bins; ++i) {
+        bin_sums[i] = 0;
+    }
+
+    // 2. Paralelizacija sa redukcijom po nizu
+    // Sintaksa reduction(+:bin_sums[:num_bins]) stvara privatne kopije niza za svaku nit
+    // i na kraju ih sumira u originalni niz bin_sums.
+    #pragma omp parallel for reduction(+:bin_sums[:num_bins])
+    for (size_t i = 0; i < num_assets; ++i) {
+        T val = asset_values[i];
+
+        // Mapiranje trenutne vrednosti na odgovarajući indeks (bin)
+        // Formula: (vrednost / max_vrednost) * broj_binova
+        int bin_idx = static_cast<int>((val / max_value) * num_bins);
+
+        // Zastita od ispadanja iz granica niza
+        if (bin_idx < 0) {
+            bin_idx = 0;
+        } else if (bin_idx >= num_bins) {
+            bin_idx = num_bins - 1; // Ako je vrednost >= max_value, stavi je u poslednji bin
+        }
+
+        // Akumulacija sume u izracunati opseg
+        bin_sums[bin_idx] += val;
+    }
+}
+
+int main() {
+    // Postavke primera
+    const size_t num_assets = 1000000;
+    const int num_bins = 10;
+    const double max_value = 10000.0;
+
+    // Generisanje niza imovine sa nekim vrednostima (npr. od 0 do 10000)
+    std::vector<double> asset_values(num_assets);
+    for (size_t i = 0; i < num_assets; ++i) {
+        // Rasporedjujemo vrednosti ravnomerno za potrebe testiranja
+        asset_values[i] = (i % 10000) + 0.5; 
+    }
+
+    // Niz u koji cemo smestati sume
+    std::vector<double> bin_sums(num_bins, 0.0);
+
+    // Poziv sablon funkcije
+    // Obratiti paznju: std::vector se u C-style niz pretvara pozivom metode .data()
+    compute_bin_sums(asset_values.data(), num_assets, bin_sums.data(), num_bins, max_value);
+
+    // Ispis rezultata
+    std::cout << "Sume vrednosti imovine po opsezima:\n";
+    for (int i = 0; i < num_bins; ++i) {
+        double lower_bound = (static_cast<double>(i) / num_bins) * max_value;
+        double upper_bound = (static_cast<double>(i + 1) / num_bins) * max_value;
+        
+        std::cout << "Opseg " << i << " [" << lower_bound << " - " << upper_bound << "): " 
+                  << bin_sums[i] << "\n";
+    }
+
+    return 0;
+}
+
+
+
+/*
+Koristeći MPI rutine kolektivne komunikacije, izračunati dužinu vektora čiji su elementi double brojevi. Vektor je inicijalizovan slučajnim vrednostima u root procesu. Broj elemenata vektora nije deljiv sa brojem procesa. NAPOMENA: Dužina vektora jednaka je kvadratnom korenu sume kvadrata njegovih elemenata.
+*/
+
+#include <mpi.h>
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <cstdlib>
+#include <ctime>
+
+int main(int argc, char** argv) {
+    MPI_Init(&argc, &argv);
+
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    // Definišemo broj elemenata vektora koji (najčešće) nije deljiv brojem procesa.
+    // Na primer, N = 23, a broj procesa može biti 4.
+    int N = 23; 
+
+    // Iako je root taj koji ima podatke, svi procesi moraju da znaju N 
+    // kako bi rezervisali memoriju i znali koliko elemenata dobijaju.
+    MPI_Bcast(&N, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    // Nizovi za MPI_Scatterv koji definišu podelu posla
+    std::vector<int> sendcounts(size);
+    std::vector<int> displs(size);
+    
+    int remainder = N % size;
+    int current_displ = 0;
+
+    // Računanje broja elemenata za svaki proces i njihovog početnog indeksa
+    for (int i = 0; i < size; i++) {
+        // Prvih 'remainder' procesa dobija po jedan element više
+        sendcounts[i] = N / size + (i < remainder ? 1 : 0);
+        displs[i] = current_displ;
+        current_displ += sendcounts[i];
+    }
+
+    std::vector<double> global_vec;
+    
+    // Inicijalizacija u root procesu
+    if (rank == 0) {
+        global_vec.resize(N);
+        std::srand(std::time(nullptr));
+        
+        std::cout << "Generisani vektor: [ ";
+        for (int i = 0; i < N; i++) {
+            // Generisanje slučajnih brojeva u opsegu od 0.0 do 10.0
+            global_vec[i] = ((double)std::rand() / RAND_MAX) * 10.0;
+            std::cout << global_vec[i] << " ";
+        }
+        std::cout << "]\n";
+    }
+
+    // Broj elemenata koji pripada trenutnom procesu (lokalno N)
+    int local_n = sendcounts[rank];
+    std::vector<double> local_vec(local_n);
+
+    // Korišćenje kolektivne rutine MPI_Scatterv za distribuciju neravnomernih delova
+    MPI_Scatterv(
+        rank == 0 ? global_vec.data() : nullptr, // Root šalje iz global_vec, ostali ignorišu
+        sendcounts.data(),                       // Niz sa veličinama delova
+        displs.data(),                           // Niz sa ofsetima (početnim indeksima)
+        MPI_DOUBLE,                              // Tip podataka koji se šalje
+        local_vec.data(),                        // Bafer u koji proces prima podatke
+        local_n,                                 // Koliko elemenata trenutni proces prima
+        MPI_DOUBLE,                              // Tip podataka koji se prima
+        0,                                       // Root proces koji distribuira
+        MPI_COMM_WORLD                           // Komunikator
+    );
+
+    // Svaki proces racuna sumu kvadrata svojih dodeljenih elemenata
+    double local_sum = 0.0;
+    for (int i = 0; i < local_n; i++) {
+        local_sum += local_vec[i] * local_vec[i];
+    }
+
+    // Korišćenje kolektivne rutine MPI_Reduce za sabiranje svih lokalnih suma u globalnu
+    double global_sum = 0.0;
+    MPI_Reduce(&local_sum, &global_sum, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+
+    // Root proces računa kvadratni koren i štampa finalni rezultat
+    if (rank == 0) {
+        double vector_length = std::sqrt(global_sum);
+        std::cout << "\nDuzina (Euklidska norma) vektora je: " << vector_length << std::endl;
+    }
+
+    MPI_Finalize();
+    return 0;
+}
